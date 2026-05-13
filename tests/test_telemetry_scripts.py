@@ -64,6 +64,15 @@ def test_dashboard_has_useful_openswarm_sections() -> None:
     assert "OpenSwarm / Recent telemetry samples" in names
 
 
+def test_recent_samples_table_supports_dashboard_filters() -> None:
+    payloads = build_insight_payloads(123)
+    samples = next(payload for payload in payloads if payload["name"] == "OpenSwarm / Recent telemetry samples")
+
+    query = samples["query"]["source"]["query"]
+    assert "WHERE {filters}" in query
+    assert "ORDER BY timestamp DESC" in query
+
+
 def test_dashboard_layout_puts_kpis_in_one_compact_row() -> None:
     payloads = build_insight_payloads(123)
     fake_dashboard = {

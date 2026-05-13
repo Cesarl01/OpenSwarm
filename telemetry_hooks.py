@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import inspect
 import logging
 import time
@@ -13,6 +14,12 @@ from agents.lifecycle import AgentHooksBase, RunHooksBase
 import telemetry
 
 logger = logging.getLogger(__name__)
+_trusted_message_context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "openswarm_trusted_message_context",
+    default=None,
+)
+_trusted_thread_managers: dict[int, dict[str, Any]] = {}
+_MESSAGE_TYPES = {"message"}
 
 
 class CompositeRunHooks(RunHooksBase[Any, Any]):
@@ -118,12 +125,14 @@ class OpenSwarmTelemetryAgentHooks(AgentHooksBase[Any, Any]):
     async def on_start(self, context: Any, agent: Any) -> None:
         key = _context_agent_key(context, agent)
         self._agent_start_times[key] = time.monotonic()
-        telemetry.capture("agent_run_started", _agent_props(context, agent, status="started"))
+        props = _agent_props(context, agent, status="started")
+        _set_trusted_message_context(props)
+        _safe_capture("agent_run_started", props)
 
     async def on_end(self, context: Any, agent: Any, output: Any) -> None:
         key = _context_agent_key(context, agent)
         started = self._agent_start_times.pop(key, None)
-        telemetry.capture(
+        _safe_capture(
             "agent_run_completed",
             _agent_props(
                 context,
@@ -142,15 +151,16 @@ class OpenSwarmTelemetryAgentHooks(AgentHooksBase[Any, Any]):
         started = self._tool_start_times.pop(_context_tool_key(context, agent, tool_name), None)
         props = _agent_props(context, agent, status="completed", latency_ms=_elapsed_ms(started))
         props["tool_name"] = tool_name
-        telemetry.capture("tool_invoked", props)
+        _safe_capture("tool_invoked", props)
 
     async def on_handoff(self, context: Any, agent: Any, source: Any) -> None:
         source_name = _agent_name(source)
         props = _agent_props(context, agent, status="completed")
+        _set_trusted_message_context(props)
         if source_name:
             props["caller_agent_name"] = source_name
             props["parent_agent_id"] = telemetry.agent_id(source_name)
-        telemetry.capture("handoff", props)
+        _safe_capture("handoff", props)
 
     async def on_llm_start(self, context: Any, agent: Any, system_prompt: str | None, input_items: list[Any]) -> None:
         self._llm_start_times[_context_agent_key(context, agent)] = time.monotonic()
@@ -163,7 +173,7 @@ class OpenSwarmTelemetryAgentHooks(AgentHooksBase[Any, Any]):
         stop_reason = _stop_reason(response)
         if stop_reason:
             props["stop_reason"] = stop_reason
-        telemetry.capture("llm_generation_completed", props)
+        _safe_capture("llm_generation_completed", props)
 
 
 class TelemetryStreamingRunResponse:
@@ -183,6 +193,7 @@ class TelemetryStreamingRunResponse:
         return self
 
     async def __anext__(self) -> Any:
+        token = _set_trusted_message_context(self._base_props)
         try:
             return await self._stream.__anext__()
         except StopAsyncIteration:
@@ -191,8 +202,11 @@ class TelemetryStreamingRunResponse:
         except BaseException as exc:
             self._error(exc)
             raise
+        finally:
+            _reset_trusted_message_context(token)
 
     async def asend(self, value: Any) -> Any:
+        token = _set_trusted_message_context(self._base_props)
         try:
             return await self._stream.asend(value)
         except StopAsyncIteration:
@@ -201,15 +215,21 @@ class TelemetryStreamingRunResponse:
         except BaseException as exc:
             self._error(exc)
             raise
+        finally:
+            _reset_trusted_message_context(token)
 
     async def athrow(self, typ: Any, val: Any = None, tb: Any = None) -> Any:
+        token = _set_trusted_message_context(self._base_props)
         try:
             return await self._stream.athrow(typ, val, tb)
         except BaseException as exc:
             self._error(exc)
             raise
+        finally:
+            _reset_trusted_message_context(token)
 
     async def aclose(self) -> None:
+        token = _set_trusted_message_context(self._base_props)
         try:
             await self._stream.aclose()
         except BaseException as exc:
@@ -217,6 +237,7 @@ class TelemetryStreamingRunResponse:
             raise
         finally:
             self._complete(status="cancelled" if self._cancelled else "closed")
+            _reset_trusted_message_context(token)
 
     def cancel(self, mode: str = "immediate") -> None:
         self._cancelled = True
@@ -225,11 +246,14 @@ class TelemetryStreamingRunResponse:
             cancel(mode=mode)
 
     async def wait_final_result(self) -> Any:
+        token = _set_trusted_message_context(self._base_props)
         try:
             result = await self._stream.wait_final_result()
         except BaseException as exc:
             self._error(exc)
             raise
+        finally:
+            _reset_trusted_message_context(token)
         self._complete(status="cancelled" if self._cancelled else "completed", run_result=result)
         return result
 
@@ -253,7 +277,7 @@ class TelemetryStreamingRunResponse:
         props = dict(self._base_props)
         props.update({"status": status, "latency_ms": _elapsed_ms(self._started_at)})
         props.update(_usage_props_from_run_result(run_result if run_result is not None else self.final_result))
-        telemetry.capture("swarm_run_completed", props)
+        _safe_capture("swarm_run_completed", props)
 
     def _error(self, exc: BaseException) -> None:
         if self._finished:
@@ -261,13 +285,14 @@ class TelemetryStreamingRunResponse:
         self._finished = True
         props = dict(self._base_props)
         props.update({"status": "error", "latency_ms": _elapsed_ms(self._started_at)})
-        telemetry.capture_error(exc, category="swarm_run", properties=props)
+        _safe_capture_error(exc, category="swarm_run", properties=props)
 
 
 def instrument_agency(agency: Any) -> Any:
     """Attach OpenSwarm telemetry to an Agency instance without replacing hooks."""
 
     install_thread_manager_telemetry()
+    _register_thread_manager_context(agency)
     _attach_agent_hooks(_iter_agents(agency))
     _wrap_agency_methods(agency)
     if getattr(agency, "persistence_hooks", None) is not None:
@@ -300,13 +325,19 @@ def install_thread_manager_telemetry() -> None:
 
     def add_message(self: Any, message: Any) -> Any:
         result = original_add_message(self, message)
-        _capture_message_sent(message, self)
+        try:
+            _capture_message_sent(message, self)
+        except Exception:
+            logger.debug("Telemetry message capture failed", exc_info=True)
         return result
 
     def add_messages(self: Any, messages: list[Any]) -> Any:
         result = original_add_messages(self, messages)
         for message in messages or []:
-            _capture_message_sent(message, self)
+            try:
+                _capture_message_sent(message, self)
+            except Exception:
+                logger.debug("Telemetry message capture failed", exc_info=True)
         return result
 
     ThreadManager.add_message = add_message
@@ -325,31 +356,34 @@ def _wrap_agency_methods(agency: Any) -> None:
         args = _compose_hooks_override(args, kwargs)
         props = _swarm_props(self, args, kwargs, is_streaming=False, status="started")
         started_at = time.monotonic()
-        telemetry.capture("swarm_run_started", props)
+        _safe_capture("swarm_run_started", props)
+        token = _set_trusted_message_context(props)
         try:
             result = await original_get_response(*args, **kwargs)
         except BaseException as exc:
             error_props = dict(props)
             error_props.update({"status": "error", "latency_ms": _elapsed_ms(started_at)})
-            telemetry.capture_error(exc, category="swarm_run", properties=error_props)
+            _safe_capture_error(exc, category="swarm_run", properties=error_props)
             raise
+        finally:
+            _reset_trusted_message_context(token)
         completed_props = dict(props)
         completed_props.update({"status": "completed", "latency_ms": _elapsed_ms(started_at)})
         completed_props.update(_usage_props_from_run_result(result))
-        telemetry.capture("swarm_run_completed", completed_props)
+        _safe_capture("swarm_run_completed", completed_props)
         return result
 
     def get_response_stream_with_telemetry(self: Any, *args: Any, **kwargs: Any) -> Any:
         args = _compose_hooks_override(args, kwargs)
         props = _swarm_props(self, args, kwargs, is_streaming=True, status="started")
         started_at = time.monotonic()
-        telemetry.capture("swarm_run_started", props)
+        _safe_capture("swarm_run_started", props)
         try:
             stream = original_get_response_stream(*args, **kwargs)
         except BaseException as exc:
             error_props = dict(props)
             error_props.update({"status": "error", "latency_ms": _elapsed_ms(started_at)})
-            telemetry.capture_error(exc, category="swarm_run", properties=error_props)
+            _safe_capture_error(exc, category="swarm_run", properties=error_props)
             raise
         return TelemetryStreamingRunResponse(stream, props, started_at)
 
@@ -387,20 +421,30 @@ def _iter_agents(agency: Any) -> list[Any]:
     return list(entry_points or [])
 
 
+def _register_thread_manager_context(agency: Any) -> None:
+    manager = getattr(agency, "thread_manager", None)
+    if manager is None:
+        return
+    agent_names = {name for name in (_agent_name(agent) for agent in _iter_agents(agency)) if name}
+    _trusted_thread_managers[id(manager)] = {"agent_names": agent_names}
+
+
 def _capture_message_sent(message: Any, manager: Any) -> None:
     if not isinstance(message, dict):
         return
     role = message.get("role")
     if role not in {"user", "assistant"}:
         return
-    agent_name = _safe_text(message.get("agent"))
-    caller_agent_name = _safe_text(message.get("callerAgent"))
+    trusted_context = _message_context_for(manager)
+    known_agent_names = trusted_context.get("agent_names") or set()
+    agent_name = _trusted_agent_name(trusted_context, known_agent_names)
+    caller_agent_name = _trusted_message_agent_name(message.get("callerAgent"), known_agent_names)
     props: dict[str, Any] = {
         "message_role": role,
-        "message_type": _safe_text(message.get("type")) or "message",
+        "message_type": _safe_message_type(message.get("type")),
         "thread_id": telemetry.thread_id(id(manager)),
         "session_id": telemetry._SESSION_ID,
-        "is_streaming": bool(message.get("streaming", False)),
+        "is_streaming": bool(trusted_context.get("is_streaming", False)),
     }
     if agent_name:
         props["agent_name"] = agent_name
@@ -408,10 +452,57 @@ def _capture_message_sent(message: Any, manager: Any) -> None:
     if caller_agent_name:
         props["caller_agent_name"] = caller_agent_name
     for key in ("agent_run_id", "parent_run_id", "run_trace_id"):
-        value = _safe_text(message.get(key))
+        value = _safe_text(trusted_context.get(key))
         if value:
             props[key] = value
-    telemetry.capture("message_sent", props)
+    _safe_capture("message_sent", props)
+
+
+def _message_context_for(manager: Any) -> dict[str, Any]:
+    context = dict(_trusted_message_context.get() or {})
+    manager_context = _trusted_thread_managers.get(id(manager), {})
+    agent_names = set(manager_context.get("agent_names") or set())
+    agent_names.update(context.get("agent_names") or set())
+    context["agent_names"] = agent_names
+    return context
+
+
+def _trusted_agent_name(context: dict[str, Any], known_agent_names: set[str]) -> str | None:
+    agent_name = _safe_text(context.get("agent_name"))
+    if not agent_name:
+        return None
+    if known_agent_names and agent_name not in known_agent_names:
+        return None
+    return agent_name
+
+
+def _trusted_message_agent_name(value: Any, known_agent_names: set[str]) -> str | None:
+    candidate = _safe_text(value)
+    if not candidate or not known_agent_names:
+        return None
+    return candidate if candidate in known_agent_names else None
+
+
+def _safe_message_type(value: Any) -> str:
+    candidate = _safe_text(value)
+    if candidate in _MESSAGE_TYPES:
+        return candidate
+    return "message"
+
+
+def _set_trusted_message_context(props: dict[str, Any]) -> contextvars.Token[dict[str, Any] | None]:
+    current = dict(_trusted_message_context.get() or {})
+    merged = {**current, **props}
+    if "agent_names" in current and "agent_names" not in props:
+        merged["agent_names"] = current["agent_names"]
+    return _trusted_message_context.set(merged)
+
+
+def _reset_trusted_message_context(token: contextvars.Token[dict[str, Any] | None]) -> None:
+    try:
+        _trusted_message_context.reset(token)
+    except Exception:
+        logger.debug("Could not reset telemetry message context", exc_info=True)
 
 
 def _swarm_props(agency: Any, args: tuple[Any, ...], kwargs: dict[str, Any], *, is_streaming: bool, status: str) -> dict[str, Any]:
@@ -458,6 +549,22 @@ def _agent_props(context: Any, agent: Any, **extra: Any) -> dict[str, Any]:
             props[target_key] = value
     props.update({key: value for key, value in extra.items() if value is not None})
     return props
+
+
+def _safe_capture(event: str, properties: dict[str, Any] | None = None) -> bool:
+    try:
+        return telemetry.capture(event, properties)
+    except Exception:
+        logger.debug("Telemetry capture failed for event %s", event, exc_info=True)
+        return False
+
+
+def _safe_capture_error(error: BaseException, *, category: str, properties: dict[str, Any] | None = None) -> bool:
+    try:
+        return telemetry.capture_error(error, category=category, properties=properties)
+    except Exception:
+        logger.debug("Telemetry error capture failed for category %s", category, exc_info=True)
+        return False
 
 
 def _model_name(agent: Any) -> str | None:

@@ -45,10 +45,14 @@ def telemetry_events(monkeypatch: pytest.MonkeyPatch, tmp_path):
     monkeypatch.setenv("OPENSWARM_TELEMETRY_ALLOW_TESTS", "1")
     monkeypatch.setattr(telemetry, "_MODULE_DIR", tmp_path)
     telemetry._reset_for_tests()
+    telemetry_hooks._trusted_thread_managers.clear()
+    telemetry_hooks._trusted_message_context.set(None)
     events: list[dict] = []
     telemetry.set_posthog_factory_for_tests(lambda api_key, host: FakePostHog(api_key, host, events))
     yield events
     telemetry._reset_for_tests()
+    telemetry_hooks._trusted_thread_managers.clear()
+    telemetry_hooks._trusted_message_context.set(None)
 
 
 def test_env_key_enables_telemetry(monkeypatch: pytest.MonkeyPatch, telemetry_events: list[dict]) -> None:
@@ -316,24 +320,119 @@ def test_streaming_error_fires_on_consumption(monkeypatch: pytest.MonkeyPatch, t
 
 def test_message_sent_extracts_only_safe_fields(monkeypatch: pytest.MonkeyPatch, telemetry_events: list[dict]) -> None:
     monkeypatch.setenv("POSTHOG_API_KEY", "ph_env")
+    token = telemetry_hooks._trusted_message_context.set(
+        {
+            "agent_name": "Docs Agent",
+            "agent_run_id": "trusted_run",
+            "run_trace_id": "trusted_trace",
+            "agent_names": {"Docs Agent", "Orchestrator"},
+        }
+    )
     message = {
         "role": "assistant",
         "type": "message",
         "content": [{"type": "output_text", "text": "do not send"}],
-        "agent": "Docs Agent",
+        "agent": "user controlled secret",
         "callerAgent": "Orchestrator",
-        "agent_run_id": "run_1",
-        "run_trace_id": "trace_1",
+        "agent_run_id": "/Users/private/run",
+        "run_trace_id": "secret_trace",
     }
 
-    telemetry_hooks._capture_message_sent(message, manager=object())
+    try:
+        telemetry_hooks._capture_message_sent(message, manager=object())
+    finally:
+        telemetry_hooks._trusted_message_context.reset(token)
 
     props = telemetry_events[0]["properties"]
     assert props["agent_name"] == "Docs Agent"
     assert props["caller_agent_name"] == "Orchestrator"
+    assert props["agent_run_id"] == "trusted_run"
+    assert props["run_trace_id"] == "trusted_trace"
     assert props["message_role"] == "assistant"
     assert "content" not in props
     assert "do not send" not in str(props)
+    assert "user controlled secret" not in str(props)
+    assert "/Users/private" not in str(props)
+
+
+def test_message_sent_without_trusted_agent_context_drops_message_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    telemetry_events: list[dict],
+) -> None:
+    monkeypatch.setenv("POSTHOG_API_KEY", "ph_env")
+
+    telemetry_hooks._capture_message_sent(
+        {
+            "role": "assistant",
+            "type": "arbitrary-private-type",
+            "agent": "private user text",
+            "callerAgent": "private caller text",
+            "agent_run_id": "private run",
+        },
+        manager=object(),
+    )
+
+    props = telemetry_events[0]["properties"]
+    assert props["message_type"] == "message"
+    assert "agent_name" not in props
+    assert "caller_agent_name" not in props
+    assert "agent_run_id" not in props
+    assert "private" not in str(props)
+
+
+def test_thread_manager_wrapper_ignores_message_telemetry_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    telemetry_hooks.install_thread_manager_telemetry()
+    from agency_swarm.utils.thread import ThreadManager
+
+    def fail_capture(*args, **kwargs):
+        raise RuntimeError("telemetry failure")
+
+    monkeypatch.setattr(telemetry_hooks, "_capture_message_sent", fail_capture)
+    manager = ThreadManager()
+
+    manager.add_message({"role": "user", "type": "message", "content": "product path still works"})
+
+
+def test_streaming_completion_ignores_telemetry_capture_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_capture(*args, **kwargs):
+        raise RuntimeError("telemetry failure")
+
+    monkeypatch.setattr(telemetry_hooks.telemetry, "capture", fail_capture)
+    stream = telemetry_hooks.TelemetryStreamingRunResponse(
+        TwoItemStream(),
+        {"agent_name": "Orchestrator", "is_streaming": True},
+        telemetry_hooks.time.monotonic(),
+    )
+
+    async def consume_stream() -> list[str]:
+        consumed = []
+        async for item in stream:
+            consumed.append(item)
+        return consumed
+
+    assert asyncio.run(consume_stream()) == ["first", "second"]
+
+
+def test_agency_run_wrapper_ignores_telemetry_capture_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeAgency:
+        entry_points = [SimpleNamespace(name="Orchestrator")]
+
+        async def get_response(self, *args, **kwargs):
+            return SimpleNamespace()
+
+        def get_response_stream(self, *args, **kwargs):
+            return TwoItemStream()
+
+    def fail_capture(*args, **kwargs):
+        raise RuntimeError("telemetry failure")
+
+    agency = FakeAgency()
+    monkeypatch.setattr(telemetry_hooks.telemetry, "capture", fail_capture)
+    telemetry_hooks._wrap_agency_methods(agency)
+
+    result = asyncio.run(agency.get_response("hello"))
+
+    assert isinstance(result, SimpleNamespace)
 
 
 def test_tool_invoked_payload_drops_content_like_properties(monkeypatch: pytest.MonkeyPatch, telemetry_events: list[dict]) -> None:

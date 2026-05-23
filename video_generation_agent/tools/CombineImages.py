@@ -6,7 +6,7 @@ from pathlib import Path
 
 import os
 from dotenv import load_dotenv
-from google import genai
+import google.genai as genai
 from PIL import Image
 from pydantic import Field, field_validator
 

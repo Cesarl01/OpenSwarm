@@ -8,7 +8,7 @@ from pydantic import Field, field_validator
 
 from agency_swarm import BaseTool
 from shared_tools.openai_client_utils import get_openai_client
-from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
+from moviepy import VideoFileClip, ImageClip, CompositeVideoClip
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from openai import OpenAI

@@ -76,6 +76,10 @@ The default pattern is **orchestrator-to-all**: the orchestrator can send messag
 
 ## How to Customize
 
+Todos los agentes deben responder siempre en español.
+
+
+
 To build your own swarm from this repo:
 
 1. **Fork and rename** the repo (e.g., `seo-swarm`)

@@ -5,7 +5,7 @@ import os
 from typing import Literal
 from dotenv import load_dotenv
 
-from google import genai
+import google.genai as genai
 from pydantic import Field, field_validator
 
 from agency_swarm import BaseTool

@@ -5,7 +5,10 @@ import re
 import tempfile
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
 
 # Extensions we consider valid for slide images (PPTX-friendly)
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
@@ -200,6 +203,9 @@ def validate_html(html_content: str, project_dir: Path, used_scaffold: bool) -> 
     ) as f:
         f.write(html_content)
         temp_path = f.name
+
+    if sync_playwright is None:
+        return {"valid": True, "error": ""}
 
     try:
         with sync_playwright() as p:

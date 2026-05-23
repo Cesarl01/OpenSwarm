@@ -1,7 +1,14 @@
 import os
 
-from composio import Composio
-from composio_openai_agents import OpenAIAgentsProvider
+try:
+    from composio import Composio
+except ImportError:
+    Composio = None
+
+try:
+    from composio_openai_agents import OpenAIAgentsProvider
+except ImportError:
+    OpenAIAgentsProvider = None
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -17,9 +24,9 @@ def get_composio_user_id() -> str | None:
     return None
 
 
-def get_composio_client() -> Composio | None:
+def get_composio_client():
     api_key = os.getenv("COMPOSIO_API_KEY")
-    if not api_key:
+    if not api_key or Composio is None:
         return None
     if api_key in _composio_clients:
         return _composio_clients[api_key]
